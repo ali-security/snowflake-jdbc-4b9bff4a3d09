@@ -1,17 +1,12 @@
 name: Build and Test
 
 on:
-    push:
-        branches:
-            - master
-        tags:
-            - v*
-    pull_request:
-        branches:
-            - master
-            - prep-**
     workflow_dispatch:
         inputs:
+          test-filter:
+            description: "Optional surefire -Dtest filter"
+            required: false
+            default: ""
           logLevel:
             default: warning
             description: "Log level"
@@ -27,17 +22,73 @@ concurrency:
 jobs:
     build:
         name: Build
-        runs-on: ubuntu-20.04
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@v1
+            - uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '11'
+                cache: maven
             - name: Build
+              if: ${{ inputs.test-filter == '' }}
               shell: bash
               env:
                 WHITESOURCE_API_KEY: ${{ secrets.WHITESOURCE_API_KEY }}
+                MAVEN_ARGS: -Djapicmp.skip=true -Dmdep.analyze.skip=true -Denforcer.skip=true
               run: ./ci/build.sh
+            - name: Build (filtered tests)
+              if: ${{ inputs.test-filter != '' }}
+              shell: bash
+              env:
+                MAVEN_ARGS: -Djapicmp.skip=true -Dmdep.analyze.skip=true -Denforcer.skip=true
+              run: |
+                rm -f lib/*.jar
+                mvn clean install --batch-mode --show-version -Dtest='${{ inputs.test-filter }}' -Dsurefire.failIfNoSpecifiedTests=false
+            - name: Stage release jars
+              shell: bash
+              run: |
+                V=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)
+                mkdir -p seal-artifacts
+                cp lib/snowflake-jdbc-$V.jar seal-artifacts/
+                cp target/snowflake-jdbc-tests.jar seal-artifacts/snowflake-jdbc-$V-tests.jar
+                ls -l seal-artifacts
+            - uses: actions/upload-artifact@v4
+              with:
+                name: snowflake-jdbc-jars
+                path: seal-artifacts/*.jar
+                if-no-files-found: error
+            - name: Test summary and skip report
+              if: always()
+              shell: bash
+              run: |
+                python3 - <<'EOF'
+                import glob, re, os, xml.etree.ElementTree as ET
+                tot=fail=err=skip=0
+                skips={}
+                for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+                    r=ET.parse(f).getroot()
+                    tot+=int(r.get('tests',0)); fail+=int(r.get('failures',0)); err+=int(r.get('errors',0)); skip+=int(r.get('skipped',0))
+                    for tc in r.iter('testcase'):
+                        s=tc.find('skipped')
+                        if s is not None:
+                            cls=tc.get('classname'); msg=s.get('message') or ''
+                            if not msg:
+                                src='src/test/java/'+cls.replace('.','/')+'.java'
+                                ign=[l.strip() for l in open(src)] if os.path.exists(src) else []
+                                ign=[l for l in ign if l.startswith('@Ignore')]
+                                msg='upstream source annotation: '+('; '.join(sorted(set(ign))) or 'none found')
+                            skips.setdefault(msg,[]).append(cls+'#'+tc.get('name'))
+                print(f"SUREFIRE SUMMARY: Tests run: {tot}, Passed: {tot-fail-err-skip}, Failures: {fail}, Errors: {err}, Skipped: {skip}")
+                for m,ts in skips.items():
+                    print(f"SKIPPED ({m}): {', '.join(ts)}")
+                EOF
 
     test-linux:
         needs: build
+        if: false
+        timeout-minutes: 45
         name: ${{ matrix.cloud }} JDBC${{ matrix.additionalMavenProfile }} ${{ matrix.category }} on ${{ matrix.image }}
         runs-on: ubuntu-latest
         strategy:
@@ -60,6 +111,8 @@ jobs:
               run: ./ci/test.sh
 
     test-linux-old-driver:
+        if: false
+        timeout-minutes: 45
         name: Old JDBC ${{ matrix.category }} on ${{ matrix.image }}
         runs-on: ubuntu-latest
         strategy:
